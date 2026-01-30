@@ -22,6 +22,7 @@ namespace small_point_lio {
         std::string lidar_type = declare_parameter<std::string>("lidar_type");
         std::string lidar_frame = declare_parameter<std::string>("lidar_frame");
         bool save_pcd = declare_parameter<bool>("save_pcd");
+        bool use_host_time = declare_parameter<bool>("use_host_time", false);
         small_point_lio = std::make_unique<small_point_lio::SmallPointLio>(*this);
         odometry_publisher = create_publisher<nav_msgs::msg::Odometry>("/Odometry", 1000);
         pointcloud_publisher = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 1000);
@@ -49,12 +50,19 @@ namespace small_point_lio {
                         RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "save pcd success");
                     }).detach();
                 });
-        small_point_lio->set_odometry_callback([this, lidar_frame](const common::Odometry &odometry) {
+        small_point_lio->set_odometry_callback([this, lidar_frame, use_host_time](const common::Odometry &odometry) {
             last_odometry = odometry;
 
             builtin_interfaces::msg::Time time_msg;
-            time_msg.sec = std::floor(odometry.timestamp);
-            time_msg.nanosec = static_cast<uint32_t>((odometry.timestamp - time_msg.sec) * 1e9);
+            if (use_host_time)
+            {
+                time_msg = this->now();
+            }
+            else
+            {
+                time_msg.sec = std::floor(odometry.timestamp);
+                time_msg.nanosec = static_cast<uint32_t>((odometry.timestamp - time_msg.sec) * 1e9);
+            }
 
             geometry_msgs::msg::TransformStamped transform_stamped;
             transform_stamped.header.stamp = time_msg;
@@ -98,11 +106,18 @@ namespace small_point_lio {
             tf_broadcaster->sendTransform(transform_stamped);
             odometry_publisher->publish(odometry_msg);
         });
-        small_point_lio->set_pointcloud_callback([this, save_pcd, lidar_frame](const std::vector<Eigen::Vector3f> &pointcloud) {
+        small_point_lio->set_pointcloud_callback([this, save_pcd, lidar_frame, use_host_time](const std::vector<Eigen::Vector3f> &pointcloud) {
             if (pointcloud_publisher->get_subscription_count() > 0) {
                 builtin_interfaces::msg::Time time_msg;
-                time_msg.sec = std::floor(last_odometry.timestamp);
-                time_msg.nanosec = static_cast<uint32_t>((last_odometry.timestamp - time_msg.sec) * 1e9);
+                if (use_host_time)
+                {
+                    time_msg = this->now();
+                }
+                else
+                {
+                    time_msg.sec = std::floor(last_odometry.timestamp);
+                    time_msg.nanosec = static_cast<uint32_t>((last_odometry.timestamp - time_msg.sec) * 1e9);
+                }
 
                 geometry_msgs::msg::TransformStamped lidar_frame_to_base_link_transform;
                 try {
@@ -194,18 +209,36 @@ namespace small_point_lio {
             rclcpp::shutdown();
             return;
         }
-        lidar_adapter->setup_subscription(this, lidar_topic, [this](const std::vector<common::Point> &pointcloud) {
-            small_point_lio->on_point_cloud_callback(pointcloud);
+        lidar_adapter->setup_subscription(this, lidar_topic, [this, use_host_time](const std::vector<common::Point> &pointcloud) {
+            if (use_host_time && !pointcloud.empty()) {
+                // Rebase point timestamps to host time while preserving intra-scan offsets.
+                const double base_device_time = pointcloud.front().timestamp;
+                const double base_host_time = this->now().seconds();
+                std::vector<common::Point> rebased;
+                rebased.reserve(pointcloud.size());
+                for (const auto &pt : pointcloud) {
+                    common::Point p = pt;
+                    p.timestamp = base_host_time + (pt.timestamp - base_device_time);
+                    rebased.push_back(p);
+                }
+                small_point_lio->on_point_cloud_callback(rebased);
+            } else {
+                small_point_lio->on_point_cloud_callback(pointcloud);
+            }
             small_point_lio->handle_once();
         });
         imu_subsciber = create_subscription<sensor_msgs::msg::Imu>(
                 imu_topic,
                 rclcpp::SensorDataQoS(),
-                [this](const sensor_msgs::msg::Imu &msg) {
+                [this, use_host_time](const sensor_msgs::msg::Imu &msg) {
                     common::ImuMsg imu_msg;
                     imu_msg.angular_velocity = Eigen::Vector3d(msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z);
                     imu_msg.linear_acceleration = Eigen::Vector3d(msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z);
-                    imu_msg.timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9;
+                    if (use_host_time) {
+                        imu_msg.timestamp = this->now().seconds();
+                    } else {
+                        imu_msg.timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9;
+                    }
                     small_point_lio->on_imu_callback(imu_msg);
                     small_point_lio->handle_once();
                 });

@@ -11,6 +11,8 @@
 #include "lidar_adapter/livox_pointcloud2.h"
 #include "lidar_adapter/unitree_lidar.h"
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/time.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace small_point_lio {
@@ -24,6 +26,37 @@ namespace small_point_lio {
         bool save_pcd = declare_parameter<bool>("save_pcd");
         bool use_host_time = declare_parameter<bool>("use_host_time", false);
         small_point_lio = std::make_unique<small_point_lio::SmallPointLio>(*this);
+
+        // SmallPointLio's state (publish_odometry) is the IMU pose in odom.
+        // extrinsic_R/T in params follow the convention used in core:
+        //   p_imu = R * p_lidar + T
+        // i.e. they represent T_imu_lidar (lidar -> imu).
+        tf2::Transform tf_imu_from_lidar;
+        tf_imu_from_lidar.setIdentity();
+        try {
+            const auto extrinsic_T = this->get_parameter("extrinsic_T").as_double_array();
+            const auto extrinsic_R = this->get_parameter("extrinsic_R").as_double_array();
+            if (extrinsic_T.size() == 3 && extrinsic_R.size() == 9) {
+                tf_imu_from_lidar.setOrigin(tf2::Vector3(extrinsic_T[0], extrinsic_T[1], extrinsic_T[2]));
+                tf2::Matrix3x3 R(
+                    extrinsic_R[0], extrinsic_R[1], extrinsic_R[2],
+                    extrinsic_R[3], extrinsic_R[4], extrinsic_R[5],
+                    extrinsic_R[6], extrinsic_R[7], extrinsic_R[8]);
+                tf2::Quaternion q;
+                R.getRotation(q);
+                tf_imu_from_lidar.setRotation(q);
+            } else {
+                RCLCPP_WARN(
+                    rclcpp::get_logger("small_point_lio"),
+                    "extrinsic_T/R size mismatch (T=%zu, R=%zu). Use identity extrinsic.",
+                    extrinsic_T.size(), extrinsic_R.size());
+            }
+        } catch (const rclcpp::exceptions::ParameterNotDeclaredException &ex) {
+            RCLCPP_WARN(
+                rclcpp::get_logger("small_point_lio"),
+                "extrinsic_T/R not declared (%s). Use identity extrinsic.", ex.what());
+        }
+
         odometry_publisher = create_publisher<nav_msgs::msg::Odometry>("/Odometry", 1000);
         pointcloud_publisher = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 1000);
         tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -34,7 +67,7 @@ namespace small_point_lio {
         }
         map_save_trigger = create_service<std_srvs::srv::Trigger>(
                 "map_save",
-                [this, save_pcd, lidar_frame](const std_srvs::srv::Trigger::Request::SharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res) {
+                [this, save_pcd](const std_srvs::srv::Trigger::Request::SharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res) {
                     if (!save_pcd) {
                         res->success = false;
                         res->message = "pcd save is disabled";
@@ -45,12 +78,12 @@ namespace small_point_lio {
                     RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "waiting for pcd saving ...");
                     auto pointcloud_to_save = std::make_shared<std::vector<Eigen::Vector3f>>();
                     *pointcloud_to_save = pointcloud_mapping->get_points();
-                    std::thread([pointcloud_to_save, lidar_frame]() {
+                    std::thread([pointcloud_to_save]() {
                         io::pcd::write_pcd(ROOT_DIR + "/pcd/scan.pcd", *pointcloud_to_save);
                         RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "save pcd success");
                     }).detach();
                 });
-        small_point_lio->set_odometry_callback([this, lidar_frame, use_host_time](const common::Odometry &odometry) {
+        small_point_lio->set_odometry_callback([this, lidar_frame, use_host_time, tf_imu_from_lidar](const common::Odometry &odometry) {
             last_odometry = odometry;
 
             builtin_interfaces::msg::Time time_msg;
@@ -70,18 +103,30 @@ namespace small_point_lio {
             transform_stamped.child_frame_id = "base_link";
             geometry_msgs::msg::TransformStamped base_link_to_lidar_frame_transform;
             try {
-                base_link_to_lidar_frame_transform = tf_buffer->lookupTransform(lidar_frame, "base_link", time_msg);
+                // base_link <-> lidar_frame is a fixed transform (URDF). RobotStatePublisher typically publishes it at
+                // a finite rate, so requesting "now" can easily be slightly in the future and trigger extrapolation.
+                // For static transforms we always take the latest available.
+                base_link_to_lidar_frame_transform = tf_buffer->lookupTransform(lidar_frame, "base_link", tf2::TimePointZero);
             } catch (tf2::TransformException &ex) {
                 RCLCPP_ERROR(rclcpp::get_logger("small_point_lio"), "Failed to lookup transform from base_link to %s: %s", lidar_frame.c_str(), ex.what());
                 return;
             }
-            tf2::Transform tf_lidar_odom_to_lidar_frame;
-            tf_lidar_odom_to_lidar_frame.setOrigin(tf2::Vector3(odometry.position.x(), odometry.position.y(), odometry.position.z()));
-            tf_lidar_odom_to_lidar_frame.setRotation(tf2::Quaternion(odometry.orientation.x(), odometry.orientation.y(), odometry.orientation.z(), odometry.orientation.w()));
-            tf2::Transform tf_base_link_to_lidar_frame;
-            tf2::fromMsg(base_link_to_lidar_frame_transform.transform, tf_base_link_to_lidar_frame);
-            tf2::Transform tf_odom_to_base_link = tf_base_link_to_lidar_frame.inverse() * tf_lidar_odom_to_lidar_frame * tf_base_link_to_lidar_frame;
-            transform_stamped.transform = tf2::toMsg(tf_odom_to_base_link);
+
+            // T_odom_base = T_odom_imu * T_imu_lidar * T_lidar_base
+            // where:
+            //   - odometry gives T_odom_imu (IMU pose in odom)
+            //   - tf_imu_from_lidar is T_imu_lidar (lidar -> imu) from params extrinsic_R/T
+            //   - lookupTransform(lidar_frame, base_link) returns T_lidar_base (base -> lidar)
+            tf2::Transform tf_odom_from_imu;
+            tf_odom_from_imu.setOrigin(tf2::Vector3(odometry.position.x(), odometry.position.y(), odometry.position.z()));
+            tf_odom_from_imu.setRotation(tf2::Quaternion(
+                odometry.orientation.x(), odometry.orientation.y(), odometry.orientation.z(), odometry.orientation.w()));
+
+            tf2::Transform tf_lidar_from_base;
+            tf2::fromMsg(base_link_to_lidar_frame_transform.transform, tf_lidar_from_base);
+
+            tf2::Transform tf_odom_from_base = tf_odom_from_imu * tf_imu_from_lidar * tf_lidar_from_base;
+            transform_stamped.transform = tf2::toMsg(tf_odom_from_base);
 
             nav_msgs::msg::Odometry odometry_msg;
             odometry_msg.header.stamp = time_msg;
@@ -106,7 +151,7 @@ namespace small_point_lio {
             tf_broadcaster->sendTransform(transform_stamped);
             odometry_publisher->publish(odometry_msg);
         });
-        small_point_lio->set_pointcloud_callback([this, save_pcd, lidar_frame, use_host_time](const std::vector<Eigen::Vector3f> &pointcloud) {
+        small_point_lio->set_pointcloud_callback([this, save_pcd, use_host_time](const std::vector<Eigen::Vector3f> &pointcloud) {
             if (pointcloud_publisher->get_subscription_count() > 0) {
                 builtin_interfaces::msg::Time time_msg;
                 if (use_host_time)
@@ -119,24 +164,6 @@ namespace small_point_lio {
                     time_msg.nanosec = static_cast<uint32_t>((last_odometry.timestamp - time_msg.sec) * 1e9);
                 }
 
-                geometry_msgs::msg::TransformStamped lidar_frame_to_base_link_transform;
-                try {
-                    lidar_frame_to_base_link_transform = tf_buffer->lookupTransform("base_link", lidar_frame, time_msg);
-                } catch (tf2::TransformException &ex) {
-                    RCLCPP_ERROR(rclcpp::get_logger("small_point_lio"), "Failed to lookup transform from %s to base_link: %s", lidar_frame.c_str(), ex.what());
-                    return;
-                }
-                Eigen::Vector3f lidar_frame_to_base_link_T;
-                lidar_frame_to_base_link_T << static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.x),
-                        static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.y),
-                        static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.z);
-                Eigen::Matrix3f lidar_frame_to_base_link_R =
-                        Eigen::Quaternionf(
-                                static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.w),
-                                static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.x),
-                                static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.y),
-                                static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.z))
-                                .toRotationMatrix();
                 sensor_msgs::msg::PointCloud2 msg;
                 msg.header.stamp = time_msg;
                 msg.header.frame_id = "odom";
@@ -168,15 +195,14 @@ namespace small_point_lio {
                 msg.point_step = 16;
                 msg.row_step = msg.width * msg.point_step;
                 msg.data.resize(msg.row_step * msg.height);
-                Eigen::Vector3f transformed_point;
                 auto pointer = reinterpret_cast<float *>(msg.data.data());
                 for (const auto &point: pointcloud) {
-                    transformed_point = lidar_frame_to_base_link_R * point + lidar_frame_to_base_link_T;
-                    *pointer = transformed_point.x();
+                    // pointcloud from core is already in odom frame (world): p_odom = R_odom_imu * p_imu + t_odom_imu
+                    *pointer = point.x();
                     ++pointer;
-                    *pointer = transformed_point.y();
+                    *pointer = point.y();
                     ++pointer;
-                    *pointer = transformed_point.z();
+                    *pointer = point.z();
                     ++pointer;
                     *pointer = 0;
                     ++pointer;
